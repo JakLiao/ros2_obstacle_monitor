@@ -29,20 +29,31 @@ class ObstacleAvoider(Node):
         # 前方扇区 = 扇区 11（330-360°）+ 扇区 0（0-30°），跨越 0° 边界
         front_sectors = [sector_mins[11], sector_mins[0]]
         front_min = min(front_sectors)
+        # ✅ 左右半边平均距离（替代单扇区 max，抗激光噪声）
+        left_avg  = sum(sector_mins[0:6])  / 6.0   # 扇区 0-5  = 左半边 (0°..180°)
+        right_avg = sum(sector_mins[6:12]) / 6.0   # 扇区 6-11 = 右半边 (180°..360°)
+
         if front_min < self.safe_distance:
-            # 前方堵死 → 找最安全的扇区
-            best_sector = sector_mins.index(max(sector_mins))
-            # 扇区 0-5 = 左半边 (0°..180°)，扇区 6-11 = 右半边 (180°..360°)
+            # 迟滞带 0.1m：左右差 < 0.1m 时保持上一帧方向，不换边（治左右抖）
             # ROS2 REP-103: angular.z > 0 = 左转（从上往下看逆时针）
-            if best_sector < 6:
-                twist.twist.angular.z = self.angular_speed   # 左转（TwistStamped 是嵌套结构）
-            else:
-                twist.twist.angular.z = -self.angular_speed  # 右转
+            if not hasattr(self, '_last_turn_dir'):
+                self._last_turn_dir = 0   # 0=未定 / +1=左 / -1=右
+            diff = right_avg - left_avg   # >0 → 右侧更空 → 右转
+            if self._last_turn_dir == 0:
+                self._last_turn_dir = -1 if diff > 0 else +1   # 首次按当前 diff 选边
+            elif diff > 0.1:
+                self._last_turn_dir = -1   # 右侧显著更空
+            elif diff < -0.1:
+                self._last_turn_dir = +1   # 左侧显著更空
+            # |diff| ≤ 0.1 → 保持 _last_turn_dir 不变 ✅ 这就是迟滞带
+
+            twist.twist.angular.z = self._last_turn_dir * self.angular_speed
             twist.twist.linear.x = 0.0
         else:
             # 前方安全 → 直行
             twist.twist.linear.x = self.linear_speed
             twist.twist.angular.z = 0.0
+            self._last_turn_dir = 0   # 重置记忆，下次进入避障重新选边
         self.publisher.publish(twist)
 
 
