@@ -1,232 +1,237 @@
-# 🤖 ros2_obstacle_monitor
+# `obstacle_monitor` — ROS2 Python Package
 
-> **Jazzy · Gazebo Garden · TurtleBot3 Burger** — 感知-决策-执行 3 层自主避障 + Nav2 导航
-
-[![ROS2 Jazzy](https://img.shields.io/badge/ROS2-Jazzy-blue)](https://docs.ros.org/en/jazzy/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-green)](https://www.python.org/)
+> **Day 3-4 核心包**：TurtleBot3 避障感知 + 决策节点（Nav2 导航见 [`config/nav2_burger_sim.yaml`](config/nav2_burger_sim.yaml)）
+>
+> 顶层项目 README：[`/README.md`](../../README.md) — 仓库介绍 / 多包布局 / 跨包运行步骤 / 6 条踩坑 / 简历描述
 
 ---
 
-## 🎯 项目背景
+## 1. 包概览
 
-**定位**：ROS2 入门级完整链路项目——**感知（激光雷达扇区分析）→ 决策（12 扇区最大间隙法）→ 执行（TwistStamped 速度控制）→ 导航（Nav2 自主规划）**。
-
-**差异化**（简历视角）：
-
-- 🟢 **自下而上全栈**：从激光 `/scan` raw data 出发，自己写 detector + avoider，不用现成包
-- 🟢 **工程化配置管理**：项目级 `params_file` + 完整踩坑入档（5 条 Day 4 实战）
-- 🟢 **Day 1-4 7 天速成项目**：4 天从零到 Nav2 自主导航，简历可直接用
-
-**对标岗位**：机器人算法工程师 / ROS2 工程师 / 嵌入式控制（中级）
+| 项 | 值 |
+|---|---|
+| 包名 | `obstacle_monitor` |
+| 构建类型 | `ament_python` |
+| 入口可执行 | `obstacle_detector`、`obstacle_avoider` |
+| 资源 | `launch/obstacle_monitor.launch.py`、`config/nav2_burger_sim.yaml` |
+| 依赖 | `rclpy sensor_msgs std_msgs geometry_msgs` |
 
 ---
 
-## 🏗️ 架构
+## 2. 节点 API
 
-```mermaid
-graph LR
-    A[Gazebo<br/>仿真世界] -->|/scan<br/>/odom| B[obstacle_detector<br/>扇区分析]
-    A -->|/scan<br/>/map<br/>/tf| C[Nav2 stack<br/>amcl + costmap<br/>planner + controller]
-    B -->|/obstacle_warning| D[obstacle_avoider<br/>12 扇区最大间隙]
-    D -->|/cmd_vel<br/>TwistStamped| C
-    C -->|/cmd_vel| A
-    A -.->|/tf_static<br/>URDF| E[robot_state_publisher]
+### 2.1 `obstacle_detector`（感知层）
+
+**职责**：订阅激光雷达，发布前向障碍物告警布尔。
+
+| 端口 | 方向 | 类型 | 频率 | 说明 |
+|---|---|---|---|---|
+| `/scan` | sub | `sensor_msgs/LaserScan` | 10 Hz | Gazebo 雷达输出 |
+| `/obstacle_warning` | pub | `std_msgs/Bool` | 跟随 `/scan` | true = 前向扇区内检测到障碍物 |
+
+**参数**（节点内常量，目前需改源码调，未来可改 `declare_parameter`）：
+
+| 参数 | 默认值 | 单位 | 含义 |
+|---|---|---|---|
+| `front_angle_range` | 60 | 度 | 前向扇区总宽度（覆盖斜前方避免漏检） |
+| `threshold` | 0.5 | 米 | 触发告警的最小距离 |
+
+**算法**：
+
+```
+n = len(ranges)                              # 通常 360
+center = n // 2
+half_window = int(angle_range / (angle_increment * 180 / π))
+front = ranges[center - half_window : center + half_window]
+valid = [r for r in front if range_min < r < range_max]   # 滤 inf / nan
+warning = min(valid) < threshold
 ```
 
-**3 层职责**：
+**典型日志**（`ros2 run` 触发）：
 
-| 层 | 节点 | 职责 | 输入 | 输出 |
-|----|------|------|------|------|
-| **感知** | `obstacle_detector` | 激光雷达扇区分析 | `/scan` | `/obstacle_warning` |
-| **决策** | `obstacle_avoider` | 12 扇区最大间隙法 | `/scan` | `/cmd_vel (TwistStamped)` |
-| **导航** | Nav2 全家桶 | 定位 + 路径规划 + 控制 | `/scan /map /tf` | `/cmd_vel (TwistStamped)` |
+```
+[WARN] [obstacle_detector]: ⚠️ 前向扇区 ±30° 障碍物 0.42m (< 0.5m)
+```
+
+### 2.2 `obstacle_avoider`（决策层）
+
+**职责**：12 扇区扫描 + 左右半边平均 + 0.1m 迟滞带，发布避障速度。
+
+| 端口 | 方向 | 类型 | 频率 | 说明 |
+|---|---|---|---|---|
+| `/scan` | sub | `sensor_msgs/LaserScan` | 10 Hz | 雷达 |
+| `/cmd_vel` | pub | `geometry_msgs/TwistStamped` | 跟随 `/scan` | **Jazzy 强制**（带 `header.stamp` + `frame_id`） |
+
+**参数**：
+
+| 参数 | 默认值 | 单位 | 含义 |
+|---|---|---|---|
+| `safe_distance` | 0.5 | 米 | 前向 < 此值触发转向 |
+| `linear_speed` | 0.2 | m/s | 前进速度 |
+| `angular_speed` | 0.5 | rad/s | 转弯角速度 |
+
+**算法**：
+
+```
+12 扇区（每扇区 30°）→ sector_mins[0..11]
+front_sectors = [sector_mins[11], sector_mins[0]]   # 跨越 0° 边界
+front_min = min(front_sectors)
+
+left_avg  = mean(sector_mins[0:6])    # 扇区 0-5  = 左半边 (0°..180°)
+right_avg = mean(sector_mins[6:12])   # 扇区 6-11 = 右半边 (180°..360°)
+
+if front_min < safe_distance:
+    # 0.1m 迟滞带：左右差 < 0.1m → 保持上一帧方向（治撞墙原地左右抖）
+    if |left_avg - right_avg| < 0.1 and last_turn_dir is not None:
+        turn = last_turn_dir
+    elif left_avg > right_avg:
+        turn = +1   # 左转（REP-103: angular.z > 0 = 左）
+    else:
+        turn = -1   # 右转
+    cmd_vel = (0, ±angular_speed)
+else:
+    cmd_vel = (linear_speed, 0)
+```
+
+**与 Nav2 抢 `/cmd_vel` 的处理**：avoider 和 Nav2 不能同时开（详见顶层 README 踩坑 #5）。本包默认走 Nav2 模式，avoider 仅作 Day 3 学习 demo。
 
 ---
 
-## 🛠️ 依赖
+## 3. Launch
 
-| 依赖 | 版本 | 安装命令 |
-|------|------|----------|
-| ROS2 | Jazzy (Ubuntu 24.04) | `sudo apt install ros-jazzy-desktop` |
-| Gazebo | Garden（RosGz） | 随 `ros-jazzy-desktop` |
-| TurtleBot3 | jazzy-devel | `sudo apt install ros-jazzy-turtlebot3*` |
-| Nav2 | Jazzy | `sudo apt install ros-jazzy-navigation2 ros-jazzy-nav2-bringup ros-jazzy-nav2-map-server` |
-| Cartographer | Jazzy | `sudo apt install ros-jazzy-turtlebot3-cartographer` |
-| Python | 3.12 | 随 Ubuntu 24.04 |
+### `launch/obstacle_monitor.launch.py`
 
----
+同时启动 detector + avoider：
 
-## 🚀 运行步骤
-
-**前置**：ROS2 Jazzy + 上述依赖装好，地图存为 `~/map.yaml`
-
-### Step 1：起 Gazebo 仿真
 ```bash
-export TURTLEBOT3_MODEL=burger
-export DISPLAY=:0  # WSL2 用户必加
-source /opt/ros/jazzy/setup.bash
-ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
-```
-
-### Step 2：起 Nav2 + 自定义节点
-```bash
-export TURTLEBOT3_MODEL=burger
-source /opt/ros/jazzy/setup.bash
-ros2 launch turtlebot3_navigation2 navigation2.launch.py \
-  map:=$HOME/map.yaml \
-  params_file=/home/xiaoduo/ros2_ws/src/obstacle_monitor/config/nav2_burger_sim.yaml
-```
-
-### Step 3（可选）：起自定义避障节点
-```bash
-source /opt/ros/jazzy/setup.bash
 ros2 launch obstacle_monitor obstacle_monitor.launch.py
-# ⚠️ 注意：跟 Nav2 跑同一环境时必须二选一（/cmd_vel 抢资源）
 ```
 
-### Step 4：起 rviz2 看建图 / 导航
+输出示例（两个节点 stdout 混在终端）：
+
+```
+[obstacle_detector-1] [INFO] [...]: 节点已就绪
+[obstacle_avoider-1] [INFO] [...]: 节点已就绪
+```
+
+> 如果只想要 avoider（避开 Nav2 抢 `/cmd_vel`）：注释掉 `Node(obstacle_detector)` 或另写一个 `avoider_only.launch.py`。
+
+---
+
+## 4. 配置
+
+### `config/nav2_burger_sim.yaml`（451 行）
+
+Nav2 全栈项目级 `params_file`，顶层 `use_sim_time: true` + 13 个 Nav2 节点同步注入。完整内容见文件，**关键节点**：
+
+| 节点 | 关键参数 | 说明 |
+|---|---|---|
+| `amcl` | `set_initial_pose: false`（按设计） | 启动后等 `/initialpose` topic；需在 rviz2 给 2D Pose Estimate |
+| `amcl` | `base_frame_id: "base_footprint"` | TB3 Burger 标配 |
+| `planner_server` | `planner_plugins: ["GridBased"]` | smac_planner 2D |
+| `controller_server` | `controller_plugins: ["FollowPath"]` | DWB LocalPlanner |
+| `bt_navigator` | `default_nav_to_pose_bt_xml` | 内置行为树 |
+
+**为什么需要项目级 params_file**：Jazzy 的 `nav2_bringup launch` 不接受命令行 `use_sim_time:=true`（lifecycle_manager 抛 exception），必须 YAML 顶层注入。详见顶层 README 踩坑 #1。
+
+---
+
+## 5. 扩展开发
+
+### 5.1 加新节点
+
 ```bash
-export DISPLAY=:0
-source /opt/ros/jazzy/setup.bash
-# 文件名是 tb3_ 缩写（Jazzy 包作者命名）
-rviz2 -d /opt/ros/jazzy/share/turtlebot3_navigation2/rviz/tb3_navigation2.rviz
+# 1. 在 src/obstacle_monitor/obstacle_monitor/ 下新建 my_node.py
+# 2. 编辑 src/obstacle_monitor/setup.py entry_points 加：
+'console_scripts': [
+    'my_node = obstacle_monitor.my_node:main',
+    # ... 原有
+]
+# 3. 编辑 package.xml 加新依赖（如果有）
+# 4. 重新编译
+cd ~/ros2_ws
+colcon build --packages-select obstacle_monitor
+source install/setup.bash
+# 5. 跑
+ros2 run obstacle_monitor my_node
 ```
 
-**RViz 操作**：
-1. **2D Pose Estimate**（顶部按钮）—— 在地图上标机器人初始位姿
-2. **Nav2 Goal**（顶部按钮）—— 点目标点 + 拖箭头标朝向
+### 5.2 加新 Launch 文件
+
+在 `src/obstacle_monitor/launch/` 下新建 `my_launch.py`，`setup.py` 的 `data_files` 已自动 include `launch/*.launch.py`，无需改 setup.py。
+
+### 5.3 加新配置
+
+把 YAML 放 `src/obstacle_monitor/config/`，**setup.py 不需要改**（ament_python 默认不会 install config/，需手动加 `data_files` glob，或运行时用绝对路径 `params_file:=/abs/path/...`）。
+
+### 5.4 跑测试
+
+```bash
+cd ~/ros2_ws
+colcon build --packages-select obstacle_monitor --cmake-args -DBUILD_TESTING=ON
+source install/setup.bash
+colcon test --packages-select obstacle_monitor
+# 详细输出
+colcon test-result --verbose
+```
+
+包内含 3 个 linter 测试（`test/test_copyright.py` / `test_flake8.py` / `test_pep257.py`），CI 跑 ament 规范检查。
 
 ---
 
-## 📊 运行截图
-
-### 节点图（rqt_graph）
-![rqt_graph_nav2](docs/rqt_graph_nav2.png)
-*Nav2 全家桶 + 感知-决策-执行 3 层节点图*
-
-### 自主导航（待补）
-*Day 4 验证：规划路径 + 机器人走通（已跑通）*
-
----
-
-## 🎬 演示视频
-
-🚧 Day 4 视频录制中——待补 YouTube/B 站链接
-
----
-
-## 📝 核心算法
-
-### 障碍物检测（`obstacle_detector.py`）
-- **输入**：`sensor_msgs/LaserScan`（360 个点）
-- **处理**：前向 ±30° 扇区（30 个点）取最小距离
-- **输出**：`/obstacle_warning` 布尔（true = 前向 0.5m 内有障碍）
-
-### 避障决策（`obstacle_avoider.py`）
-- **输入**：`/scan`（360 个点）
-- **处理**：12 扇区（每扇区 30°）→ 找距离最大的扇区 → 取扇区中心角 → 输出角速度
-- **输出**：`/cmd_vel (TwistStamped)` 线速度 0.1m/s + 角速度朝最大间隙方向
-
-### 自主导航（Nav2）
-- **定位**：AMCL（粒子滤波，amcl_pose）
-- **全局规划**：Jazzy 默认 smac_planner
-- **局部控制**：DWB LocalPlanner（dwb_core::DWBLocalPlanner）
-- **TF 树**：map → odom → base_footprint → base_link → laser
-
----
-
-## 📊 性能基准（5 类场景 × 10 次实测）
-
-> 运维视角的"差异化信号"——招聘者看到量化数字 = 工程化能力
-
-| 场景类型 | 成功率 | 平均决策延迟 | p95 延迟 | CPU 占用 | 内存占用 | 备注 |
-|---------|--------|------------|---------|---------|---------|------|
-| 单一墙体 | 待补 | — | — | — | — | Day 5 录数据 |
-| L 型拐角 | 待补 | — | — | — | — | Day 5 |
-| 狭窄走廊 | 待补 | — | — | — | — | Day 5 |
-| 动态障碍 | 待补 | — | — | — | — | Day 5 |
-| 传感器噪声 | 待补 | — | — | — | — | Day 5 |
-| **平均** | — | — | — | — | — | — |
-
-**测试方法**：
-- 5 类场景在 Gazebo Garden `turtlebot3_world` 基础上扩展
-- `ros2 bag record /scan /cmd_vel /odom` 录 30s 数据 → Python 离线分析
-- 决策延迟 = callback 入 → /cmd_vel 出的时间差
-
----
-
-## ⚠️ 踩坑汇总（开发实录）
-
-> 写给后续维护者 + 面试"线上踩过什么坑"用
-
-### Day 1-3（基础 + 自定义节点）
-- **`obstacle_detector` 斜前方柱子漏检**：前向 ±15° 扇区太窄 → 扩到 ±30° 解决
-- **`obstacle_avoider` 全 inf 误判**：扇区无有效数据时默认 max → 加 `valid count > 5` 阈值
-
-### Day 4（Nav2 集成）—— 6 条实战入档
-- **`/cmd_vel` 消息类型不匹配**：Jazzy 用 `TwistStamped`（不是 `Twist`），`ros_gz_bridge` 桥接要求带 timestamp
-- **建图必做**：Nav2 启动前必须先 cartographer 建图存为 `~/map.yaml`（不传 `map` 参数 → map_server 拿不到地图 → AMCL 不发 `map → odom` TF → costmap 报 `frame 'map' does not exist`）
-- **map 参数必传**：`ros2 launch turtlebot3_navigation2 navigation2.launch.py map:=$HOME/map.yaml`
-- **use_sim_time 修复**：命令行 `:=true` 报 "Wrong parameter type, parameter {use_sim_time} is of type {bool}, setting it to {string} is not allowed"（lifecycle_manager 抛 exception，Nav2 整个起不来）→ 唯一修法是**项目级 params_file YAML**（`nav2_burger_sim.yaml`，13 个 `use_sim_time: true` 注入）
-- **AMCL 默认 set_initial_pose: false**（按设计如此）：AMCL 启动后**等 /initialpose topic**；RViz 里**不点 2D Pose Estimate** → AMCL 永远不开始定位。一劳永逸改 YAML：`set_initial_pose: true` + `initial_pose: {x:-2, y:-0.5, z:0, yaw:0}` + `always_reset_initial_pose: true`
-- **.rviz 文件名错**（Jazzy 包作者用缩写）：`tb3_cartographer.rviz` / `tb3_navigation2.rviz` —— **不是** `turtlebot3_*` 命名
-- **avoider 跟 Nav2 抢 /cmd_vel**（Day 3 节点冲突）：avoider 发 `TwistStamped`，Nav2 也发 `TwistStamped`，但**Gazebo 桥接只接 1 个 publisher**。Day 4 跑 Nav2 之前**必须** Ctrl+C 关掉 Day 3 的 `obstacle_monitor.launch.py` 终端
-
-### 通用运维坑
-- **Gazebo 僵尸进程**：`pkill -9 gzserver gzclient` → `bash ~/.openclaw/workspace/scripts/cleanup-gz.sh` → 重启
-- **WSL2 Gazebo 窗口不显示**：`export DISPLAY=:0` + Windows 端 VcXsrv/Xming 起着
-
----
-
-## 📁 项目结构
+## 6. 包内文件清单
 
 ```
 obstacle_monitor/
-├── README.md                  # 本文件
-├── package.xml                # ROS2 包描述
-├── setup.py                   # Python 入口
-├── obstacle_monitor/          # 节点源码
-│   ├── obstacle_detector.py   # 感知层（激光雷达扇区分析）
-│   └── obstacle_avoider.py    # 决策层（12 扇区最大间隙法）
+├── README.md                  # 本文件（包开发者视角）
+├── package.xml                # ament_python 包描述
+├── setup.py                   # 入口声明 + 资源 glob
+├── setup.cfg                  # ament 默认配置
+├── obstacle_monitor/          # Python 源码
+│   ├── __init__.py
+│   ├── obstacle_detector.py   # 感知层
+│   └── obstacle_avoider.py    # 决策层
 ├── launch/
-│   └── obstacle_monitor.launch.py  # Day 3 启动
+│   └── obstacle_monitor.launch.py
 ├── config/
-│   └── nav2_burger_sim.yaml   # Nav2 项目级 params_file（13 个 use_sim_time + 1 个 set_initial_pose 修复）
-└── docs/
-    └── rqt_graph_nav2.png     # Day 4 节点图截图（7691x4591, 2.6MB PNG）
+│   └── nav2_burger_sim.yaml   # Nav2 全栈 params_file
+├── docs/
+│   └── rqt_graph_nav2.png     # 节点拓扑截图（顶层 README 引用）
+├── resource/
+│   └── obstacle_monitor       # ament 索引标记文件
+└── test/
+    ├── test_copyright.py
+    ├── test_flake8.py
+    └── test_pep257.py
 ```
 
 ---
 
-## 🎯 简历项目描述（v1.6 · 知途 6/8 升级）
+## 7. 跨包依赖图
 
-### 中文版（投递国内 BOSS/猎聘）
+```
+            ┌─────────────────────────────────────┐
+            │ 顶层 / 跨包运行步骤 / 6 条踩坑 / 简历描述  │
+            │         → /README.md (项目 README)    │
+            └─────────────────────────────────────┘
+                              ▲
+                              │ 引用
+            ┌─────────────────┴──────────────────┐
+            │  本 README（包开发者视角）              │
+            │  - 节点 API/参数/算法                 │
+            │  - Launch / 配置 / 扩展开发            │
+            └─────────────────┬──────────────────┘
+                              │ 依赖
+       ┌──────────────────────┼──────────────────────┐
+       ▼                      ▼                      ▼
+ obstacle_detector.py   obstacle_avoider.py   nav2_burger_sim.yaml
+ （感知 / /scan → /obstacle_warning） （决策 / /scan → /cmd_vel）   （Nav2 全栈 / 13 节点）
+```
 
-> **ros2_obstacle_monitor · 个人项目 · 2026.06**
->
-> 基于 ROS2 Jazzy + Gazebo Garden + TurtleBot3 Burger 的感知-决策-执行 3 层自主避障 + Nav2 导航系统。
-> - **感知层**：自研 `obstacle_detector` 节点，订阅激光雷达 `/scan`，前向 ±30° 扇区实时告警
-> - **决策层**：自研 `obstacle_avoider` 节点，12 扇区最大间隙法，平均决策延迟 < 100ms
-> - **导航层**：集成 Nav2 全家桶（amcl + costmap_2d + smac_planner + DWBLocalPlanner），实现 RViz 2D Pose Estimate + Nav2 Goal 自主导航
-> - **工程化**：项目级 `params_file` 管理 13 个 Nav2 节点参数，6 条 Day 4 实战踩坑入档
->
-> **技术栈**：ROS2 Jazzy · Python 3.12 · rclpy · tf2 · Nav2 · Gazebo Garden · Cartographer · RViz2
-
-### 英文版（投递外企 / 跨境岗位）
-
-> **ros2_obstacle_monitor · Personal Project · Jun 2026**
->
-> Full-stack ROS2 autonomous obstacle avoidance + Nav2 navigation system on TurtleBot3 Burger, built from scratch over 4 days.
-> - **Perception**: Custom `obstacle_detector` node — 360° LaserScan → forward ±30° sector analysis, real-time obstacle warning
-> - **Decision**: Custom `obstacle_avoider` node — 12-sector max-gap algorithm, avg decision latency < 100ms
-> - **Navigation**: Integrated Nav2 stack (amcl + costmap_2d + smac_planner + DWBLocalPlanner) — 2D Pose Estimate + Nav2 Goal in RViz
-> - **Engineering**: Project-level `params_file` overrides 13 Nav2 nodes (use_sim_time + set_initial_pose), 6 production-incident troubleshooting entries documented
->
-> **Stack**: ROS2 Jazzy · Python 3.12 · rclpy · tf2 · Nav2 · Gazebo Garden · Cartographer · RViz2
+> 简历项目描述（中文+英文）见顶层 README §1，**不在此重复**以保持单一来源。
 
 ---
 
-## 📜 License
+## 8. License
 
-MIT
+MIT © JakLiao
